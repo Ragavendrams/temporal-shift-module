@@ -13,10 +13,23 @@ from PIL import Image, ImageOps
 import onnx
 import tvm.contrib.graph_runtime as graph_runtime
 from mobilenet_v2_tsm import MobileNetV2
-
+# from tvm.contrib.debugger import debug_runtime as graph_runtime
+from torchsummary import summary
+from torchvision import models
+import warnings
+import logging
+import tune_relay as tr
+from tvm import autotvm
+# logging.getLogger('autotvm').setLevel(logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
+# warnings.simplefilter("always")
 SOFTMAX_THRES = 0
 HISTORY_LOGIT = True
 REFINE_OUTPUT = True
+AUTOTUNE = 0
+USE_HISTORY = 1
+PRELOAD = 0
+USE_GPU = 0
 
 def torch2tvm_module(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tensor, ...], target):
     torch_module.eval()
@@ -33,8 +46,17 @@ def torch2tvm_module(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Te
         buffer.seek(0, 0)
         onnx_model = onnx.load_model(buffer)
         relay_module, params = tvm.relay.frontend.from_onnx(onnx_model, shape=input_shapes)
-    with tvm.relay.build_config(opt_level=3):
-        graph, tvm_module, params = tvm.relay.build(relay_module, target, params=params)
+
+    if AUTOTUNE:
+        graph, tvm_module, params = tr.tune_and_evaluate(relay_module, params, target, torch_inputs)
+    elif USE_HISTORY:
+        with autotvm.apply_history_best('tsm1_save.log'):
+            with tvm.relay.build_config(opt_level=3):
+                graph, tvm_module, params = tvm.relay.build(relay_module, target, params=params)
+    else:
+        with tvm.relay.build_config(opt_level=3):
+            graph, tvm_module, params = tvm.relay.build(relay_module, target, params=params)
+
     return graph, tvm_module, params
 
 
@@ -43,10 +65,10 @@ def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tens
     lib_fname = f'{prefix}.tar'
     graph_fname = f'{prefix}.json'
     params_fname = f'{prefix}.params'
-    if os.path.exists(lib_fname) and os.path.exists(graph_fname) and os.path.exists(params_fname):
+    if os.path.exists(lib_fname) and os.path.exists(graph_fname) and os.path.exists(params_fname) and PRELOAD:
         with open(graph_fname, 'rt') as f:
             graph = f.read()
-        tvm_module = tvm.module.load(lib_fname)
+        tvm_module = tvm.runtime.load_module(lib_fname)
         params = tvm.relay.load_param_dict(bytearray(open(params_fname, 'rb').read()))
     else:
         graph, tvm_module, params = torch2tvm_module(torch_module, torch_inputs, target)
@@ -57,6 +79,7 @@ def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tens
             f.write(tvm.relay.save_param_dict(params))
 
     ctx = tvm.gpu() if target.startswith('cuda') else tvm.cpu()
+    print(ctx)
     graph_module = graph_runtime.create(graph, tvm_module, ctx)
     for pname, pvalue in params.items():
         graph_module.set_input(pname, pvalue)
@@ -72,6 +95,8 @@ def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tens
 
 def get_executor(use_gpu=True):
     torch_module = MobileNetV2(n_class=27)
+    # print(torch_module)
+
     if not os.path.exists("mobilenetv2_jester_online.pth.tar"):  # checkpoint not downloaded
         print('Downloading PyTorch checkpoint...')
         import urllib.request
@@ -89,10 +114,12 @@ def get_executor(use_gpu=True):
                     torch.zeros([1, 12, 14, 14]),
                     torch.zeros([1, 20, 7, 7]),
                     torch.zeros([1, 20, 7, 7]))
+    #summary(torch_module, torch_inputs)
     if use_gpu:
-        target = 'cuda'
+        target = 'cuda -model=tx2'
     else:
-        target = 'llvm -mcpu=cortex-a72 -target=armv7l-linux-gnueabihf'
+        target = 'llvm -device=arm_cpu -target=aarch64-linux-gnu' #-mcpu=cortex-a57
+        # target = tvm.target.arm_cpu('-target=aarch64-linux-gnu')
     return torch2executor(torch_module, torch_inputs, target)
 
 
@@ -258,13 +285,21 @@ def process_output(idx_, history):
 WINDOW_NAME = 'Video Gesture Recognition'
 def main():
     print("Open camera...")
-    cap = cv2.VideoCapture(0)
-    
+    #cap = cv2.VideoCapture(0)
+    gst_str = ('nvarguscamerasrc ! '
+                   'video/x-raw(memory:NVMM), '
+                   'width=(int)2592, height=(int)1944, '
+                   'format=(string)NV12, framerate=(fraction)30/1 ! '
+                   'nvvidconv ! '
+                   'video/x-raw, width=(int){}, height=(int){}, '
+                   'format=(string)BGRx ! '
+                   'videoconvert ! appsink').format(1280,720)
+    cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
     print(cap)
 
     # set a lower resolution for speed up
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+    #cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    #cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
     # env variables
     full_screen = False
@@ -279,7 +314,7 @@ def main():
     print("Build transformer...")
     transform = get_transform()
     print("Build Executor...")
-    executor, ctx = get_executor()
+    executor, ctx = get_executor(USE_GPU)
     buffer = (
         tvm.nd.empty((1, 3, 56, 56), ctx=ctx),
         tvm.nd.empty((1, 4, 28, 28), ctx=ctx),
@@ -293,7 +328,7 @@ def main():
         tvm.nd.empty((1, 20, 7, 7), ctx=ctx)
     )
     idx = 0
-    history = [2]
+    history = [2,2,2,2]
     history_logit = []
     history_timing = []
 
